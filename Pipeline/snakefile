@@ -1,0 +1,1129 @@
+import subprocess
+import time
+
+datasets, subjects = glob_wildcards('./datasets/{dataset}/{subject}/structural/')
+
+Allsubjects = [f'{dataset}/{subject}' for dataset, subject in zip(datasets, subjects)]
+
+# group subjects so rules can be targeted
+HCP1200 = [subject for subject in Allsubjects if subject.startswith('HCP_1200/')]
+
+# Small group with confirmed 7T diffusion
+HCP_smallGroup = ["HCP_1200/100610", "HCP_1200/130114", "HCP_1200/165436", 
+                  "HCP_1200/167440", "HCP_1200/239136"]
+
+HCPall = HCP1200 + HCP_smallGroup
+
+NaturalScenes = [subject for subject in Allsubjects if subject.startswith('NaturalScenes/')]
+
+# subjects, = glob_wildcards('./datasets/{subject}/structural/')
+# # subjects = [subject for subject in subjects if subject.startswith('HCP1200/')]
+
+# #run few subjects for testing
+# subjects= subjects[0:3]
+
+#which gpu is available for WPSS
+gpu_list = ('3')
+
+rule all:
+    input:
+        epcHistogram            = expand("output/{subject}/segmentation/epcHistogram.png",subject=Allsubjects),
+                
+        simple_ADC_along_PVS       = expand("output/{subject}/disentangling/simple_ADC_along_PVS.nii",subject=HCP_smallGroup),
+        CMT_ADC_along_PVS          = expand("output/{subject}/disentangling/extended_DTI_ALPS.nii",subject=HCP_smallGroup),
+
+        PVS_correlation     = expand("output/{subject}/disentangling/PVS_correlation_summary.txt",subject=HCP_smallGroup),
+
+# Segmentation Rules
+rule adaptiveNLMfilter:
+    input:
+        t1w     = ancient("datasets/{subject}/structural/T1w_brain.nii.gz"),
+        t2w     = ancient("datasets/{subject}/structural/T2w_brain.nii.gz"),
+        # mask    = "datasets/{subject}/structural/brainmask.nii.gz",
+
+    output:
+        t1w_nlm_holes   = temp("output/{subject}/segmentation/t1w_nlm_holes.nii"),
+        t2w_nlm_holes   = temp("output/{subject}/segmentation/t2w_nlm_holes.nii"),
+        t1w_nlm         = "output/{subject}/segmentation/T1w_nlm.nii.gz",
+        t2w_nlm         = "output/{subject}/segmentation/T2w_nlm.nii.gz",
+
+    shell:
+        """
+        mkdir -p output/{wildcards.subject}/
+
+        # Denoise T1w and T2w images using NLM filter
+        qit VolumeFilterNLM --input {input.t1w} --patch 1 --rician --output {output.t1w_nlm_holes} &
+        qit VolumeFilterNLM --input {input.t2w} --patch 1 --rician --output {output.t2w_nlm_holes} &
+        wait
+
+        # Use mrcalc to replace non-finite voxels with original T1w and T2w values
+        mrcalc {output.t1w_nlm_holes} -finite {output.t1w_nlm_holes} {input.t1w} -if {output.t1w_nlm} &
+        mrcalc {output.t2w_nlm_holes} -finite {output.t2w_nlm_holes} {input.t2w} -if {output.t2w_nlm} &
+        wait
+
+        """
+
+rule gen5tt:
+    input:
+        t1w = "datasets/{subject}/structural/T1w_brain.nii.gz",
+    
+    output:
+        gen5tt = "output/{subject}/segmentation/5ttseg.nii.gz" 
+    
+    shell:
+        """
+        5ttgen fsl {input.t1w} {output.gen5tt} -nocrop -premasked
+        """
+
+# EPC contrast based on: 
+#   Farshid Sepehrband et al., 2019
+rule EPC_gen:
+    input:
+        t1w_nlm = "output/{subject}/segmentation/T1w_nlm.nii.gz",
+        t2w_nlm = "output/{subject}/segmentation/T2w_nlm.nii.gz",
+    
+    output:
+        epc = "output/{subject}/segmentation/epc.nii.gz",
+
+    shell:
+        """
+        # T1w/T2w to generate EPC
+        mrcalc {input.t1w_nlm} {input.t2w_nlm} -div 10 -min 0 -max {output.epc}
+        # mrcalc {input.t1w_nlm} {input.t2w_nlm} -div {output.epc}
+        """
+
+rule EPChistogram:
+    input:
+        epc = "output/{subject}/segmentation/epc.nii.gz",
+
+    params:
+        bins = 100,
+        snakemakeFolder = '/DATASERVER/MIC/GENERAL/STUDENTS/ccallu0/ThesisCode/snakemakePipeline/',
+
+    output:
+        txtHistogram = temp("output/{subject}/segmentation/epcHistogram"),
+        epcHistogram = "output/{subject}/segmentation/epcHistogram.png",
+
+    run:
+        import matplotlib
+        matplotlib.use('Agg') #configure matplotlib to run in backend without gui
+
+        import matplotlib.pyplot as plt
+        import os
+        import pandas as pd
+
+        shell("mrhistogram -ignorezero {input.epc} {output.txtHistogram}")
+
+        #read using pandas
+        DWI = pd.read_csv(output.txtHistogram,comment="#",header=None).T
+
+        #plot histogram using pyplot
+        plt.plot(DWI, linestyle='-',marker='o')
+        plt.xlabel("Intensity")
+        plt.ylabel("Count")
+
+        #save to hardcoded filepath
+        save_path = os.path.join(params.snakemakeFolder, output.epcHistogram)
+        plt.savefig(save_path)
+
+# Perivascular space segmentation
+#   Farshid Sepehrband et al., 2019
+rule EPC_seg:
+    input:
+        epc = "output/{subject}/segmentation/epc.nii.gz",
+        gen5tt = "output/{subject}/segmentation/5ttseg.nii.gz",
+        mask = "datasets/{subject}/structural/brainmask.nii.gz",
+        # wmparc = "datasets/{subject}/structural/wmparc.nii.gz",
+    
+    output:
+        epc_frangi              = temp("output/{subject}/segmentation/epc_frangi.nii"),
+        epc_frangi_norm         = temp("output/{subject}/segmentation/epc_frangi_norm.nii"),
+        epc_frangi_norm_seg     = temp("output/{subject}/segmentation/epc_frangi_norm_seg.nii.gz"),
+        epc_seg_oversensitive   = "output/{subject}/segmentation/epc_seg_oversensitive.nii.gz",
+        epc_seg                 = "output/{subject}/segmentation/epc_seg.nii.gz",
+        epc_seg_paper           = "output/{subject}/segmentation/epc_seg_paper.nii.gz",
+
+    shell:
+        """
+        # Frangi vesselness filter
+        qit VolumeFilterFrangi --input {input.epc} --dark --mask {input.mask} --low 0.1 --high 5.0 --output {output.epc_frangi}
+
+        #Normalising, should be interquartile but unavailable, can use std *1.35 to approximate
+        # mrcalc {output.epc_frangi} `mrstats {output.epc_frangi} -output std -ignorezero` -div {output.epc_frangi_norm}
+        # mrcalc {output.epc_frangi} `mrcalc `mrstats {output.epc_frangi} -output std -ignorezero` 1.35 -mult` -div {output.epc_frangi_norm}
+        
+        # Compute the minimum value (vmin) of the image
+        # Compute the standard deviation (std) of the image
+        # Normalize by subtracting the minimum and dividing by standard deviation approximation for IQR (1.35 * std)
+        mrcalc {output.epc_frangi} `mrstats {output.epc_frangi} -output min -ignorezero` -sub `mrcalc {output.epc_frangi} `mrstats {output.epc_frangi} -output std -ignorezero` 1.35 -mult` -div {output.epc_frangi_norm}
+
+        # Thresholding
+        #first gt is how much it can overlap with the other tissues
+        #second gt is lowest value of frangi_norm
+        # mrconvert -coord 3 3 {input.gen5tt} - | mrcalc - 0.01 -gt - | maskfilter - dilate - | mrcalc - -not {output.epc_frangi_norm} 0.2 -gt -and {output.epc_frangi_norm_seg}
+        mrconvert -coord 3 2 {input.gen5tt} - | mrcalc - 1 -ge - | mrcalc - {output.epc_frangi_norm} 0.5 -gt -and {output.epc_frangi_norm_seg}
+        mrconvert -coord 3 2 {input.gen5tt} - | mrcalc - 1 -ge - | mrcalc - {output.epc_frangi_norm} 0.1 -gt -and {output.epc_seg_oversensitive}
+        mrconvert -coord 3 2 {input.gen5tt} - | mrcalc - 1 -ge - | mrcalc - {input.epc_frangi_norm} 1.5 -gt -and {output.epc_seg_paper}
+
+        # Filter connected components
+        maskfilter {output.epc_frangi_norm_seg} connect - -connectivity| mrcalc - 0 -gt {output.epc_seg}
+        """
+
+
+# WPSS from https://github.com/Haoyulance/WPSS
+rule WPSS_seg:
+    input:
+        epc         = "output/{subject}/segmentation/epc.nii.gz",
+
+    params:
+        weights     ='/DATASERVER/MIC/GENERAL/STUDENTS/ccallu0/ThesisCode/WPSS-main/weights/EPC/epc_pretrain',
+        modality    = 'epc',
+        gpu_num = 3,
+
+    resources:
+        gpu=1 #request a single gpu, as long as 1 gpu max is specified it will not run concurrently
+
+    output:
+        WPSS_seg    = "output/{subject}/segmentation/WPSS_seg.nii.gz",
+        map1        = "output/{subject}/segmentation/WPSS_map1.nii.gz",
+        map0        = "output/{subject}/segmentation/WPSS_map0.nii.gz",
+    
+    run:
+        from ast import literal_eval
+        shell(
+            """
+            export TF_CPP_MIN_LOG_LEVEL=2
+            export PATH="/DATASERVER/MIC/GENERAL/STUDENTS/ccallu0/conda/envs/WPSSenv/bin:$PATH"
+
+            # Select correct CUDA
+            export LD_LIBRARY_PATH="/DATASERVER/MIC/GENERAL/STUDENTS/ccallu0/nvidia_libraries/cuda-9.0/lib64:$LD_LIBRARY_PATH"
+            export PATH="/DATASERVER/MIC/GENERAL/STUDENTS/ccallu0/nvidia_libraries/cuda-9.0/bin:$PATH"
+
+            # Run the prediction script on the selected GPU
+            export CUDA_VISIBLE_DEVICES={params.gpu_num}
+
+            if [ {params.gpu_num} -lt 4 ]; then
+                taskset -c 0-13,28-41 python /DATASERVER/MIC/GENERAL/STUDENTS/ccallu0/ThesisCode/WPSS-main/src/predictSingle.py --weights={params.weights} --subjectEPC={input.epc} --gpu={params.gpu_num}
+            else
+                taskset -c 14-27,42-55 python /DATASERVER/MIC/GENERAL/STUDENTS/ccallu0/ThesisCode/WPSS-main/src/predictSingle.py --weights={params.weights} --subjectEPC={input.epc} --gpu={params.gpu_num}
+            fi
+            """
+        )
+
+
+
+
+
+# SWI Contast, not all functioning, WIP
+# https://www.ajnr.org/content/30/1/19#sec-4
+ruleorder: Susceptibility_weighted > Susceptibility_weighted_raw
+rule processSWI:
+    input:
+        epc             = "output/{subject}/segmentation/epc.nii.gz",
+        SWI_mag_raw     = "datasets/{subject}/SWI/SWI_mag_raw.nii.gz",
+        SWI_phase_raw   = "datasets/{subject}/SWI/SWI_phase_raw.nii.gz",
+    output:
+        SWI_mag         = "datasets/{subject}/SWI/SWI_mag.nii.gz",
+        SWI_phase       = "datasets/{subject}/SWI/SWI_phase.nii.gz",
+    shell:
+        """
+        # Step 1: Normalize SWI phase from -4096 to 4096 to -pi to pi
+        fslmaths {input.SWI_phase_raw} -div 4096 -mul 3.14159265359 {output.SWI_phase}
+
+        # Step 2: Align SWI magnitude and phase to the EPC template
+        flirt -in {input.SWI_mag_raw} -ref {input.epc} -out {output.SWI_mag} -omat SWI_to_epc.mat
+        flirt -in {output.SWI_phase} -ref {input.epc} -out {output.SWI_phase} -applyxfm -init SWI_to_epc.mat
+        """
+rule Susceptibility_weighted:
+    input:
+        SWI_mag         = "datasets/{subject}/SWI/SWI_mag.nii.gz",
+        SWI_phase       = "datasets/{subject}/SWI/SWI_phase.nii.gz",
+        mask            = "datasets/{subject}/structural/brainmask.nii.gz",
+    output:
+        SWI_phase_hp    = "output/{subject}/SWI/SWI_phase_hp.nii.gz",
+        SWI             = "output/{subject}/SWI/SWI.nii.gz",
+    run:
+        import numpy as np
+        import nibabel as nib
+        import scipy.ndimage as ndi
+        from skimage.restoration import unwrap_phase
+        from scipy.ndimage import gaussian_filter
+        from scipy.linalg import lstsq
+        from nibabel.processing import resample_from_to
+        from scipy.ndimage import laplace
+
+        # **1. Load Magnitude, Phase, and Brain Mask Images**
+        mag_img = nib.load(input.SWI_mag)
+        phase_img = nib.load(input.SWI_phase)
+        mask_img = nib.load(input.mask)
+
+        mag_data = mag_img.get_fdata()
+        phase_data = phase_img.get_fdata()
+
+        # **2. Resample the Mask to Match the Shape of the Phase DWI**
+        # Resample mask image to match the phase image's shape and affine
+        mask_resampled_img = resample_from_to(mask_img, phase_img)
+
+        # Get the resampled DWI
+        mask_data_resampled = mask_resampled_img.get_fdata()
+
+        # **3. Apply Brain Mask to Phase and Magnitude DWI**
+        phase_data = phase_data * mask_data_resampled
+        mag_data = mag_data * mask_data_resampled
+
+        # **4. Phase Unwrapping**
+        # Unwrap the phase image to correct for phase wraps (only within brain mask)
+        phase_data = (phase_data - np.pi) % (2 * np.pi) - np.pi
+
+        # def laplacian_unwrap(phase_data):
+        #     unwrapped_phase = ndi.gaussian_filter(phase_data, sigma=1)
+        #     for _ in range(5):  # Iterative improvement
+        #         unwrapped_phase -= laplace(unwrapped_phase - phase_data)
+        #     return unwrapped_phase
+
+        # phase_data = laplacian_unwrap(phase_data)
+
+        phase_data = unwrap_phase(phase_data)
+
+        # **5. High-Pass Filtering (Background Field Removal)**
+        highpass_sigma = 10
+        phase_data = phase_data - gaussian_filter(phase_data, sigma=highpass_sigma)
+
+        # def high_pass_filter(image, low_pass_size=64, epsilon=1e-6):
+        #     """
+        #     Perform high-pass filtering on a complex image using a low-pass filter in the Fourier domain.
+
+        #     Args:
+        #     - image: 2D complex numpy array (e.g., phase image).
+        #     - low_pass_size: Size of the central low-pass filter region (e.g., 64).
+        #     - epsilon: Small value to prevent division by zero.
+
+        #     Returns:
+        #     - hp_filtered_image: High-pass filtered image.
+        #     """
+        #     # Fourier Transform of the original image
+        #     image_ft = np.fft.fftshift(np.fft.fft2(image))
+
+        #     # Create a low-pass filter by zero-filling the Fourier transform outside the central region
+        #     lp_filter = np.zeros_like(image_ft)
+        #     center = tuple(map(lambda x: x // 2, image_ft.shape))
+        #     half_size = low_pass_size // 2
+
+        #     lp_filter[
+        #         center[0] - half_size : center[0] + half_size,
+        #         center[1] - half_size : center[1] + half_size
+        #     ] = 1
+
+        #     # Apply the low-pass filter
+        #     image_lp_ft = image_ft * lp_filter
+        #     image_lp = np.fft.ifft2(np.fft.ifftshift(image_lp_ft))
+
+        #     # High-pass filtering by complex division
+        #     hp_filtered_image = image / (image_lp + epsilon)
+
+        #     return np.real(hp_filtered_image)
+        # phase_data = high_pass_filter(phase_data, low_pass_size=64)
+
+        # **8. Set Maximum Intensity Range (Clipping)**
+        # max_intensity = 100
+        # swi_phase = np.clip(phase_data, 0, max_intensity)
+        swi_phase = nib.Nifti1Image(phase_data, mag_img.affine)
+        nib.save(swi_phase, output.SWI_phase_hp)
+
+        # **6. Phase Mask Creation**
+        mask = np.ones_like(phase_data)
+        mask[phase_data < 0] = ((phase_data[phase_data < 0] + np.pi) / np.pi)
+
+        # **7. Apply Phase Mask to Magnitude Image**
+        swi_data = mag_data * mask ** 4
+
+        # **8. Set Maximum Intensity Range (Clipping)**
+        # max_intensity = 100
+        # swi_data = np.clip(swi_data, 0, max_intensity)
+        swi_img = nib.Nifti1Image(swi_data, mag_img.affine)
+        nib.save(swi_img, output.SWI)
+
+rule Susceptibility_weighted_raw:
+    input:
+        SWI_mag         = "datasets/{subject}/SWI/SWI_mag_raw.nii.gz",
+        SWI_phase       = "datasets/{subject}/SWI/SWI_phase_raw.nii.gz",
+    output:
+        SWI_phase_hp    = "output/{subject}/SWI/SWI_phase_hp.nii.gz",
+        SWI             = "output/{subject}/SWI/SWI.nii.gz",
+    run:
+        import numpy as np
+        import nibabel as nib
+        import scipy.ndimage as ndi
+        from skimage.restoration import unwrap_phase
+        from scipy.ndimage import gaussian_filter
+        from scipy.linalg import lstsq
+        from nibabel.processing import resample_from_to
+        from scipy.ndimage import laplace
+
+        # **1. Load Magnitude, Phase**
+        mag_img = nib.load(input.SWI_mag)
+        phase_img = nib.load(input.SWI_phase)
+
+        mag_data = mag_img.get_fdata()
+        phase_data = phase_img.get_fdata()
+
+        # **3. Apply Brain Mask to Phase and Magnitude DWI**
+        phase_data = phase_data
+        mag_data = mag_data
+
+        # **5. High-Pass Filtering (Background Field Removal)**
+        highpass_sigma = 10
+        phase_data = phase_data - gaussian_filter(phase_data, sigma=highpass_sigma)
+
+        # def high_pass_filter(image, low_pass_size=64, epsilon=1e-6):
+        #     """
+        #     Perform high-pass filtering on a complex image using a low-pass filter in the Fourier domain.
+
+        #     Args:
+        #     - image: 2D complex numpy array (e.g., phase image).
+        #     - low_pass_size: Size of the central low-pass filter region (e.g., 64).
+        #     - epsilon: Small value to prevent division by zero.
+
+        #     Returns:
+        #     - hp_filtered_image: High-pass filtered image.
+        #     """
+        #     # Fourier Transform of the original image
+        #     image_ft = np.fft.fftshift(np.fft.fft2(image))
+
+        #     # Create a low-pass filter by zero-filling the Fourier transform outside the central region
+        #     lp_filter = np.zeros_like(image_ft)
+        #     center = tuple(map(lambda x: x // 2, image_ft.shape))
+        #     half_size = low_pass_size // 2
+
+        #     lp_filter[
+        #         center[0] - half_size : center[0] + half_size,
+        #         center[1] - half_size : center[1] + half_size
+        #     ] = 1
+
+        #     # Apply the low-pass filter
+        #     image_lp_ft = image_ft * lp_filter
+        #     image_lp = np.fft.ifft2(np.fft.ifftshift(image_lp_ft))
+
+        #     # High-pass filtering by complex division
+        #     hp_filtered_image = image / (image_lp + epsilon)
+
+        #     return np.real(hp_filtered_image)
+        # phase_data = high_pass_filter(phase_data, low_pass_size=64)
+
+        # **8. Set Maximum Intensity Range (Clipping)**
+        # max_intensity = 100
+        # swi_phase = np.clip(phase_data, 0, max_intensity)
+        swi_phase = nib.Nifti1Image(phase_data, mag_img.affine)
+        nib.save(swi_phase, output.SWI_phase_hp)
+
+        # **6. Phase Mask Creation**
+        mask = np.ones_like(phase_data)
+        mask[phase_data < 0] = ((phase_data[phase_data < 0] + np.pi) / np.pi)
+
+        # **7. Apply Phase Mask to Magnitude Image**
+        swi_data = mag_data * mask ** 4
+
+        # **8. Set Maximum Intensity Range (Clipping)**
+        # max_intensity = 100
+        # swi_data = np.clip(swi_data, 0, max_intensity)
+        swi_img = nib.Nifti1Image(swi_data, mag_img.affine)
+        nib.save(swi_img, output.SWI)
+
+rule QSM:
+    input:
+        SWI_phase   = "datasets/{subject}/SWI/SWI_phase_raw.nii.gz",
+    output:
+        QSM = "output/{subject}/SWI/QSM.nii.gz",
+    run:
+        import numpy as np
+        import nibabel as nib
+
+        def qsm_inversion(phase_data, voxel_size=(1, 1, 1), lambda_reg=0.1):
+            kx, ky, kz = np.meshgrid(
+                np.fft.fftfreq(phase_data.shape[0]),
+                np.fft.fftfreq(phase_data.shape[1]),
+                np.fft.fftfreq(phase_data.shape[2])
+            )
+            kx, ky, kz = kx * 2 * np.pi, ky * 2 * np.pi, kz * 2 * np.pi
+            dipole_kernel = (kx**2 + ky**2 + kz**2)
+            dipole_kernel[0, 0, 0] = 1  # Prevent division by zero
+
+            F = np.fft.fftn(phase_data)
+            susceptibility_map = np.real(np.fft.ifftn(F / (dipole_kernel + lambda_reg)))
+            return susceptibility_map
+
+        # Load phase and mask images
+        phase_img = nib.load(input.SWI_phase)
+        phase_data = phase_img.get_fdata()
+
+        # Perform QSM inversion
+        qsm_data = qsm_inversion(phase_data)
+        qsm_img = nib.Nifti1Image(qsm_data, phase_img.affine)
+
+        # Save the QSM output
+        nib.save(qsm_img, output.QSM)
+
+
+rule Minimum_Intensity_Projection:
+    input:
+        SWI = "datasets/{subject}/SWI/SWI.nii.gz",
+    output:
+        SWI_MinIP_Axial = "output/{subject}/SWI/SWI_MinIP_Axial.nii.gz",
+        SWI_MinIP_Coronal = "output/{subject}/SWI/SWI_MinIP_Coronal.nii.gz",
+        SWI_MinIP_Sagittal = "output/{subject}/SWI/SWI_MinIP_Sagittal.nii.gz",
+        SWI_MinIP_avg = "output/{subject}/SWI/SWI_MinIP_avg.nii.gz",
+    run:
+        import numpy as np
+        import nibabel as nib
+
+        # Load SWI image
+        swi_img = nib.load(input.SWI)
+        swi_data = swi_img.get_fdata()
+
+        # Get the dimensions of the image
+        nx, ny, nz = swi_data.shape
+
+        # Initialize an array to hold the minimum intensity projection values
+        minip_axial     = np.zeros((nx, ny, nz))
+        minip_coronal   = np.zeros((nx, ny, nz))
+        minip_sagittal  = np.zeros((nx, ny, nz))
+        minip_avg       = np.zeros((nx, ny, nz))        
+
+        # Define the slice width for the mIP calculation
+        slice_width = 2
+
+        # Iterate through the voxel grid
+        for i in range(slice_width, nx - slice_width):
+            for j in range(slice_width, ny - slice_width):
+                for k in range(slice_width, nz - slice_width):
+                    # Min along axial (superior-inferior), slice width defines range
+                    minip_axial[i, j, k] = np.min(swi_data[i-slice_width:i+slice_width, j, k])  # Min along axial
+
+                    # Min along coronal (anterior-posterior)
+                    minip_coronal[i, j, k] = np.min(swi_data[i, j-slice_width:j+slice_width, k])  # Min along coronal
+
+                    # Min along sagittal (left-right)
+                    minip_sagittal[i, j, k] = np.min(swi_data[i, j, k-slice_width:k+slice_width])  # Min along sagittal
+
+        # Create and save a NIfTI image from the mIP data
+        minip_img = nib.Nifti1Image(minip_axial, swi_img.affine)
+        nib.save(minip_img, output.SWI_MinIP_Axial)
+
+        minip_img = nib.Nifti1Image(minip_coronal, swi_img.affine)
+        nib.save(minip_img, output.SWI_MinIP_Coronal)
+
+        minip_img = nib.Nifti1Image(minip_sagittal, swi_img.affine)
+        nib.save(minip_img, output.SWI_MinIP_Sagittal)
+
+rule SWI_vesselness:
+    input:
+        SWI                 = "datasets/{subject}/SWI/SWI.nii.gz",
+        SWI_MinIP_Axial     = "output/{subject}/SWI/SWI_MinIP_Axial.nii.gz",
+        SWI_MinIP_Coronal   = "output/{subject}/SWI/SWI_MinIP_Coronal.nii.gz",
+        SWI_MinIP_Sagittal  = "output/{subject}/SWI/SWI_MinIP_Sagittal.nii.gz",
+
+    output:      
+        SWI_vesselness      = "output/{subject}/SWI/SWI_vesselness.nii.gz",
+    run:
+        import numpy as np
+        import nibabel as nib
+        from skimage.filters import frangi
+
+        # Load SWI DWI
+        swi_img = nib.load(input.SWI_MinIP_Sagittal)
+        swi_data = swi_img.get_fdata()
+
+        # values based on https://www.researchgate.net/publication/277958131_Automatic_SWI_Venography_Segmentation_Using_Conditional_Random_Fields
+        # Apply Frangi vesselness filter
+        vesselness_data = frangi(swi_data, sigmas=(0.5, 2.5), scale_step=0.25)
+        vesselness_img = nib.Nifti1Image(vesselness_data, swi_img.affine)
+        nib.save(vesselness_img, output.SWI_vesselness) 
+
+# Diffusion Rules
+rule upscaleDiffusion:
+    input:
+        originalDTI =  "datasets/{subject}/diffusion/DWI.nii.gz",
+        structural = "output/{subject}/segmentation/epc.nii.gz",
+
+    output:
+        upscaledDTI = 'output/{subject}/diffusion/upscale.nii.gz',
+
+    shell:
+        """
+        mrgrid {input.originalDTI} regrid -template {input.structural} -interp cubic {output.upscaledDTI}
+        """
+
+rule DiffusionResponseFunctions:
+    input:
+        mask            = 'datasets/{subject}/diffusion/diffusion_mask.nii.gz',
+        data_nii        = 'datasets/{subject}/diffusion/DWI.nii.gz',
+        bvals           = 'datasets/{subject}/diffusion/bvals',
+        bvecs           = 'datasets/{subject}/diffusion/bvecs',
+        
+    output:
+        data_mif        = 'output/{subject}/diffusion/DWI.mif',
+        voxels          = 'output/{subject}/diffusion/CSD/voxels.mif',
+        wmResponse      = 'output/{subject}/diffusion/CSD/wmResponse.txt',
+        gmResponse      = 'output/{subject}/diffusion/CSD/gmResponse.txt',
+        csfResponse     = 'output/{subject}/diffusion/CSD/csfResponse.txt',
+
+    shadow: "full"
+
+    shell:
+        """
+        mrconvert {input.data_nii} {output.data_mif} -fslgrad {input.bvecs} {input.bvals} -datatype float32 -strides 0,0,0,1
+        mrcalc {output.data_mif} {input.mask} -mult {output.data_mif} -force
+
+        # Estimate response function
+        dwi2response dhollander {output.data_mif} {output.wmResponse} {output.gmResponse} {output.csfResponse} -voxels {output.voxels}
+        """ 
+
+rule FOD:
+    input:
+        mask            = 'datasets/{subject}/diffusion/diffusion_mask.nii.gz',
+        DWI             = 'output/{subject}/diffusion/DWI.mif',
+        voxels          = 'output/{subject}/diffusion/CSD/voxels.mif',
+        wmResponse      = 'output/{subject}/diffusion/CSD/wmResponse.txt',
+        gmResponse      = 'output/{subject}/diffusion/CSD/gmResponse.txt',
+        csfResponse     = 'output/{subject}/diffusion/CSD/csfResponse.txt',
+
+    resources:
+        threads = 1,
+
+    output:
+        vf              = 'output/{subject}/diffusion/CSD/vf.mif',
+        wmfod_norm      = 'output/{subject}/diffusion/CSD/wmfod_norm.mif',
+        gmfod_norm      = 'output/{subject}/diffusion/CSD/gmfod_norm.mif',
+        csffod_norm     = 'output/{subject}/diffusion/CSD/csffod_norm.mif',
+
+    shadow: "full"
+
+    shell:
+        """
+        # Estimate fiber orientation distribution
+        dwi2fod msmt_csd {input.DWI} -mask {input.mask} {input.wmResponse} wmfod.mif {input.gmResponse} gmfod.mif {input.csfResponse} csffod.mif -force
+
+        # Intensity normalization
+        mtnormalise wmfod.mif {output.wmfod_norm} gmfod.mif {output.gmfod_norm} csffod.mif {output.csffod_norm} -mask {input.mask}
+
+        mrconvert -coord 3 0 {output.wmfod_norm} - | mrcat {output.csffod_norm} {output.gmfod_norm} - {output.vf}
+        """
+
+rule ADC:
+    input:
+        mask            = 'datasets/{subject}/diffusion/diffusion_mask.nii.gz',
+        DWI             = 'output/{subject}/diffusion/DWI.mif',
+
+    output:
+        ADC             = 'output/{subject}/diffusion/ADC.mif',
+
+    shell:
+        """
+        dwi2adc {input.DWI} {output.ADC}
+        """
+
+rule DTI:
+    input:
+        mask            = 'datasets/{subject}/diffusion/diffusion_mask.nii.gz',
+        DWI             = 'output/{subject}/diffusion/DWI.mif',
+
+    output:
+        DTI             = 'output/{subject}/DTI/DTI.mif',
+        eigenvectors    = 'output/{subject}/DTI/eigenvectors.mif',
+        FA              = 'output/{subject}/DTI/FA.mif',
+        AD              = 'output/{subject}/DTI/AD.mif',
+        RD              = 'output/{subject}/DTI/RD.mif',
+
+    shell:
+        """
+        # Generate diffusion tensor
+        dwi2tensor {input.DWI} {output.DTI}
+        
+        # Compute eigenvectors and scalar metrics (FA, AD, RD) using tensor2metric
+        tensor2metric -fa {output.FA} -ad {output.AD} -rd {output.RD} {output.DTI}
+        
+        # Extract eigenvectors from the tensor
+        tensor2metric -vector {output.eigenvectors} {output.DTI}
+        """
+# Disentangling
+rule PVS_vectors:
+    input:
+        WPSS_seg =  "output/{subject}/segmentation/WPSS_seg.nii.gz",
+
+    output:
+        PVS_vectors     = 'output/{subject}/PVS_vectors.nii',
+
+    run:
+        import numpy as np
+        import nibabel as nib
+        from scipy.ndimage import gaussian_filter
+
+        def hessianVectors(image, sigma):
+            # Get dimensions of the image
+            x_dim, y_dim, z_dim = image.shape
+
+            # Initialize the vector field with the same spatial dimensions, but with 3 components (for x, y, z directions)
+            vector_field = np.zeros((x_dim, y_dim, z_dim, 3))
+
+            def compute_hessian(image, sigma):
+                """
+                Compute the Hessian matrix for each pixel in the image.
+                Hessian components are second-order partial derivatives.
+                """
+
+                # Apply Gaussian smoothing
+                smoothed_image = gaussian_filter(image, sigma)
+
+                # Compute second derivatives (Hessian components)
+                Dxx = gaussian_filter(smoothed_image, sigma, order=(2, 0, 0))
+                Dyy = gaussian_filter(smoothed_image, sigma, order=(0, 2, 0))
+                Dzz = gaussian_filter(smoothed_image, sigma, order=(0, 0, 2))
+                Dxy = gaussian_filter(smoothed_image, sigma, order=(1, 1, 0))
+                Dxz = gaussian_filter(smoothed_image, sigma, order=(1, 0, 1))
+                Dyz = gaussian_filter(smoothed_image, sigma, order=(0, 1, 1))
+                
+                return Dxx, Dyy, Dzz, Dxy, Dxz, Dyz
+        
+
+            # Compute Hessian matrix
+            Dxx, Dyy, Dzz, Dxy, Dxz, Dyz = compute_hessian(image, sigma)
+            
+            # Eigenvalue decomposition of Hessian matrix
+            for i in range(x_dim):
+                for j in range(y_dim):
+                    for k in range(z_dim):
+                        H = np.array([[Dxx[i,j,k], Dxy[i,j,k], Dxz[i,j,k]],
+                                    [Dxy[i,j,k], Dyy[i,j,k], Dyz[i,j,k]],
+                                    [Dxz[i,j,k], Dyz[i,j,k], Dzz[i,j,k]]])
+                        
+                        # Eigenvalues of Hessian matrix
+                        eigvals, eigvecs = np.linalg.eigh(H)
+                        
+                        if image[i,j,k]:
+                            vector_field[i,j,k] = eigvecs[:, np.argmin(abs(eigvals))]
+
+                            vector_field[i, j, k] = np.array([-eigvecs[0, np.argmin(abs(eigvals))], eigvecs[1, np.argmin(abs(eigvals))], eigvecs[2, np.argmin(abs(eigvals))]])
+
+            return vector_field
+
+        image_nii = nib.load(input.WPSS_seg)
+        image = image_nii.get_fdata() 
+
+        vector_field = hessianVectors(image,0.7)
+        vector_nii = nib.Nifti1Image(vector_field, image_nii.affine)        
+        nib.save(vector_nii, output.PVS_vectors)
+
+rule resampleDiffusion:
+    input:
+        WPSS_seg            = "output/{subject}/segmentation/WPSS_seg.nii.gz",
+        wmFOD_norm          = 'output/{subject}/diffusion/CSD/wmfod_norm.mif',
+        DTI                 = "output/{subject}/diffusion/DTI/DTI.mif",
+
+    output:
+        wmFOD_resampled     = 'output/{subject}/diffusion/CSD/wmfod_norm_resampled.mif',
+        DTI_resampled       = "output/{subject}/diffusion/DTI/DTI_resampled.nii",
+
+    shell:
+        """
+        # Resample wmfod_norm and DTI to match the resolution of the structural images
+        mrgrid {input.wmFOD_norm} regrid -template {input.WPSS_seg} {output.wmFOD_resampled}
+        mrgrid {input.DTI} regrid -template {input.WPSS_seg} {output.DTI_resampled}
+        """
+        
+rule sh2peak:
+    input:
+        WPSS_seg            = "output/{subject}/segmentation/WPSS_seg.nii.gz",
+        PVS_vectors         = 'output/{subject}/PVS_vectors.nii',
+        wmFOD_resampled     = 'output/{subject}/diffusion/CSD/wmfod_norm_resampled.mif',
+
+    output:
+        sh2Peak_WM          = 'output/{subject}/disentangling/sh2Peak_WM.nii',
+        sh2Peak_PVS         = 'output/{subject}/disentangling/sh2Peak_PVS.nii',
+
+    shell:
+        """       
+        # Find top 5 peaks
+        sh2peaks \
+            -num 5 \
+            -mask {input.WPSS_seg} \
+            -threshold 0.15 \
+            {input.wmFOD_resampled} \
+            {output.sh2Peak_WM}
+
+        # Find peak closest to PVS vector
+        sh2peaks \
+            -num 15 \
+            -peaks {input.PVS_vectors} \
+            -mask {input.WPSS_seg} \
+            {input.wmFOD_resampled} \
+            {output.sh2Peak_PVS}
+        """
+
+rule simple_ADC_along_PVS:
+    input:
+        WPSS_seg    = "output/{subject}/segmentation/WPSS_seg.nii.gz",
+        PVS_vectors = "output/{subject}/PVS_vectors.nii",
+        DTI_resampled   = "output/{subject}/diffusion/DTI/DTI_resampled.nii",
+    output:
+        PVS_diffusion   = "output/{subject}/disentangling/simple_ADC_along_PVS.nii"
+    run:
+        import numpy as np
+        import nibabel as nib
+        import subprocess
+
+        def reconstruct_tensor(dti_voxel):
+            """
+            Reconstructs a 3x3 diffusion tensor from its 6 independent components.
+            """
+            Dxx, Dyy, Dzz, Dxy, Dxz, Dyz = dti_voxel
+            tensor = np.array([
+                [Dxx, Dxy, Dxz],
+                [Dxy, Dyy, Dyz],
+                [Dxz, Dyz, Dzz]
+            ])
+            return tensor
+
+        def compute_adc_along_pvs(PVS_vectors, DTI):
+            """
+            Computes the apparent diffusion coefficient (ADC) along the PVS vector direction
+            for each voxel by taking the dot product of the PVS vector and diffusion tensor.
+
+            Parameters:
+                PVS_vectors: 4D numpy array (x, y, z, 3) of PVS vectors
+                DTI: 4D numpy array (x, y, z, 6) representing diffusion tensors in compact form
+            
+            Returns:
+                ADC_along_pvs: 3D numpy array (x, y, z) of ADC values
+            """
+            x_dim, y_dim, z_dim, _ = DTI.shape
+            ADC_along_pvs = np.full((x_dim, y_dim, z_dim),np.nan)
+
+
+            for i in range(x_dim):
+                for j in range(y_dim):
+                    for k in range(z_dim):
+                        vector = PVS_vectors[i, j, k, :]
+                        dti_voxel = DTI[i, j, k, :]
+                        if np.linalg.norm(vector) > 0:  # Skip if vector is zero
+                            tensor = reconstruct_tensor(dti_voxel)
+                            ADC_along_pvs[i, j, k] = vector @ tensor @ vector.T
+
+            return ADC_along_pvs
+
+
+        # Load resampled DTI and PVS vectors
+        PVS_vectors_nii = nib.load(input.PVS_vectors)
+        PVS_vectors = PVS_vectors_nii.get_fdata()
+
+        DTI_nii = nib.load(input.DTI_resampled)
+        DTI = DTI_nii.get_fdata()
+
+        # Compute ADC along PVS vectors
+        ADC_along_pvs = compute_adc_along_pvs(PVS_vectors, DTI)
+
+        # Save result as a NIfTI file
+        ADC_along_pvs_nii = nib.Nifti1Image(ADC_along_pvs, PVS_vectors_nii.affine)
+        nib.save(ADC_along_pvs_nii, output.PVS_diffusion)
+
+rule MultiTensorConstrained:
+    input:
+        PVS_vectors     = "output/{subject}/PVS_vectors.nii",
+        DWI_resampled   = "output/{subject}/diffusion/upscale.nii.gz",
+
+    output:
+        CMT_ADC_along_PVS               = "output/{subject}/disentangling/extended_DTI_ALPS.nii.gz",
+        CMT_ADC_along_PVS_normalised    = "output/{subject}/disentangling/extended_DTI_ALPS.nii.gz",
+        CMT_volumeFraction              = "output/{subject}/disentangling/volumeFraction.nii.gz",
+
+    run:
+        import numpy as np
+        import nibabel as nib
+        from scipy.optimize import minimize
+        import os
+
+        def backward_model_multi_tensor(signal, bvals, bvecs, PVS_vector):
+            """
+            Estimate parameters for a two-compartment model with white matter (WM) and PVS compartments,
+            with the PVS tensor constrained to the direction of the PVS vector for a single voxel.
+
+            Args:
+                signal (np.ndarray): Measured diffusion-weighted signal (1D array).
+                bvals (np.ndarray): b-values (1D array corresponding to signal measurements).
+                bvecs (np.ndarray): Gradient directions (Nx3 array).
+                PVS_vector (np.ndarray): The PVS orientation vector for this voxel.
+
+            Returns:
+                dict: Estimated parameters (f_WM, f_PVS, D_WM, D_PVS).
+            """
+            def model_function(params, bvals, bvecs, PVS_vector):
+                f_WM = params[0]
+                f_PVS = 1 - f_WM
+
+                # Flatten D_WM tensor (6 parameters)
+                D_WM_flat = params[1:7]
+                D_WM = np.array([[D_WM_flat[0], D_WM_flat[1], D_WM_flat[2]],
+                                [D_WM_flat[1], D_WM_flat[3], D_WM_flat[4]],
+                                [D_WM_flat[2], D_WM_flat[4], D_WM_flat[5]]])
+
+                # Constrain PVS tensor based on the PVS vector for this voxel
+                D_PVS_flat = params[7:9]  # Two parameters for PVS tensor (axial, radial diffusivity)
+                
+                # Define the PVS tensor as: D_PVS = R diag(axial, radial, radial) R^T
+                pvs_dir = PVS_vector / np.linalg.norm(PVS_vector)  # Normalize PVS direction
+                R = np.outer(pvs_dir, pvs_dir)
+                D_PVS = D_PVS_flat[0] * R + D_PVS_flat[1] * (np.eye(3) - R)  # Axial and radial diffusivities
+                
+                # Check for positive semi-definite tensors (penalize if negative eigenvalues)
+                penalty = 0
+                if not check_positive_semi_definite(D_WM):
+                    penalty += 1e6
+                if not check_positive_semi_definite(D_PVS):
+                    penalty += 1e6
+
+                # Calculate signal contributions for each compartment
+                signal_WM = np.exp(-bvals * np.einsum('ij,ij->i', bvecs @ D_WM, bvecs))
+                signal_PVS = np.exp(-bvals * np.einsum('ij,ij->i', bvecs @ D_PVS, bvecs))
+
+                # Combine signals with volume fractions
+                signal_model = f_WM * signal_WM + f_PVS * signal_PVS
+                return signal_model, penalty
+
+            def check_positive_semi_definite(tensor):
+                eigvals = np.linalg.eigvals(tensor)
+                return np.all(eigvals >= 0)
+
+            # Cost function to minimize
+            def cost_function(params):
+                predicted_signal, penalty = model_function(params, bvals, bvecs, PVS_vector)
+                cost = np.sum((signal - predicted_signal) ** 2) + penalty
+                return cost
+
+            # Initial guesses
+            initial_guess = [0.5,  # f_WM
+                            1e-3, 0, 0, 1e-3, 0, 1e-3]  # D_WM parameters
+
+            initial_guess += [2e-3, 1e-3]  # PVS tensor parameters (axial, radial)
+
+            # Perform optimization
+            result = minimize(cost_function, initial_guess, bounds=[(0, 1)] + [(-2e-3, 2e-3)] * 6 + [(-3e-3, 3e-3)] * 2, method='L-BFGS-B')
+
+            # Extract optimized parameters
+            f_WM_opt = result.x[0]
+            f_PVS_opt = 1 - f_WM_opt
+            D_WM_flat_opt = result.x[1:7]
+            D_WM_opt = np.array([[D_WM_flat_opt[0], D_WM_flat_opt[1], D_WM_flat_opt[2]],
+                                [D_WM_flat_opt[1], D_WM_flat_opt[3], D_WM_flat_opt[4]],
+                                [D_WM_flat_opt[2], D_WM_flat_opt[4], D_WM_flat_opt[5]]])
+
+            D_PVS_flat_opt = result.x[7:9]
+            pvs_dir = PVS_vector / np.linalg.norm(PVS_vector)  # Normalize the PVS vector
+            R = np.outer(pvs_dir, pvs_dir)
+            D_PVS_opt = D_PVS_flat_opt[0] * R + D_PVS_flat_opt[1] * (np.eye(3) - R)
+
+            return f_WM_opt, f_PVS_opt, D_WM_opt, D_PVS_opt
+
+        def apparent_diffusivity(D_tensor, direction):
+            """
+            Calculate the apparent diffusion coefficient (ADC) along the given direction.
+            
+            Args:
+                D_tensor (numpy.ndarray): The diffusion tensor (3x3 matrix).
+                direction (numpy.ndarray): The direction vector (3,).
+                
+            Returns:
+                float: The apparent diffusivity along the direction.
+            """
+            direction = direction / np.linalg.norm(direction)  # Normalize the direction vector
+            adc = direction.T @ D_tensor @ direction
+            return adc
+        
+        # Load data
+        dwi_img = nib.load(input.DWI_resampled)
+        dwi_data = dwi_img.get_fdata()
+
+        pvs_img = nib.load(input.PVS_vectors)
+        pvs_vectors = pvs_img.get_fdata()  # This will be a (N, 3) array of PVS orientations
+
+        bvals = np.loadtxt(input.bvals)
+        bvecs = np.loadtxt(input.bvecs)
+        bvecs = bvecs.T  # Transpose to have shape (3, N)
+
+        # Iterate through the DWI image and calculate ADC along PVS direction for non-zero PVS vectors
+        adc_values = np.zeros(dwi_data.shape[:3])  # Initialize ADC array for the 3D image
+        adc_values_VF = np.zeros(dwi_data.shape[:3])  # Initialize ADC array for the 3D image
+        VF_values = np.zeros(dwi_data.shape[:3])  # Initialize ADC array for the 3D image
+
+        # Loop through the DWI image voxel by voxel
+        for x in range(dwi_data.shape[0]):
+            for y in range(dwi_data.shape[1]):
+                for z in range(dwi_data.shape[2]):
+                    
+                    pvs_dir = pvs_vectors[x, y, z]
+                    if np.linalg.norm(pvs_dir) > 0:  # Check if the PVS vector is non-zero
+                        print(f'Voxel: {x}, {y}, {z}')
+                        voxel_signals = dwi_data[x, y, z]  # Get the diffusion signals for this voxel
+
+                        # Call the backward model for this voxel
+                        f_WM_opt, f_PVS_opt, D_WM_opt, D_PVS_opt = backward_model_multi_tensor(
+                            voxel_signals.flatten(), bvals, bvecs, PVS_vector=pvs_dir)
+                        
+                        adc = apparent_diffusivity(D_PVS_opt, pvs_dir)
+
+                        # Calculate the ADC along the PVS direction for this voxel
+                        adc_values[x, y, z] = adc
+                        adc_values_VF[x, y, z] = adc / f_PVS_opt
+                        VF_values[x, y, z] = f_PVS_opt
+
+        # Saving the ADC values to a NIfTI file
+        adc_img = nib.Nifti1Image(adc_values, dwi_img.affine)
+        nib.save(adc_img, output.CMT_ADC_along_PVS)
+
+        adc_values_VF_img = nib.Nifti1Image(adc_values_VF, dwi_img.affine)
+        nib.save(adc_values_VF_img, output.CMT_ADC_along_PVS_normalised)
+
+        VF_img = nib.Nifti1Image(VF_values, dwi_img.affine)
+        nib.save(VF_img, output.CMT_volumeFraction)
+        
+rule PVS_vector_correlation:
+    input:
+        PVS_vectors         = 'output/{subject}/PVS_vectors.nii',
+        sh2Peak_PVS         = 'output/{subject}/disentangling/sh2Peak_PVS.nii',
+
+    output:
+        PVS_correlation     = 'output/{subject}/disentangling/PVS_correlation.nii',
+        violin_plot         = 'output/{subject}/disentangling/PVS_correlation_violin_plot.png',
+        summary_stats       = 'output/{subject}/disentangling/PVS_correlation_summary.txt',
+
+    run:
+        import nibabel as nib
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+
+        # Load the input vector files
+        PVS_vectors_img = nib.load(input.PVS_vectors)
+        sh2Peak_PVS_img = nib.load(input.sh2Peak_PVS)
+
+        PVS_vectors = PVS_vectors_img.get_fdata()
+        sh2Peak_PVS = sh2Peak_PVS_img.get_fdata()
+
+        # Normalize vectors
+        def normalize(vectors):
+            norm = np.linalg.norm(vectors, axis=-1, keepdims=True)
+            norm[norm == 0] = 1  # Prevent division by zero for zero vectors
+            return vectors / norm
+
+        PVS_vectors = normalize(PVS_vectors)
+        sh2Peak_PVS = normalize(sh2Peak_PVS)
+
+        # Calculate cosine similarity (scaled to 0-1 range)
+        cosine_similarity = np.sum(PVS_vectors * sh2Peak_PVS, axis=-1)
+        cosine_similarity = np.clip(cosine_similarity, -1.0, 1.0)  # Clip for numerical stability
+        angle_correlation = (cosine_similarity + 1) / 2  # Map from [-1, 1] to [0, 1]
+
+        # Save the result as a NIfTI file
+        angle_correlation_img = nib.Nifti1Image(angle_correlation, affine=PVS_vectors_img.affine)
+        nib.save(angle_correlation_img, output.PVS_correlation)
+
+        # Flatten the correlation data for analysis
+        angle_correlation_flat = angle_correlation.flatten()
+
+        # Remove NaN values
+        angle_correlation_flat = angle_correlation_flat[~np.isnan(angle_correlation_flat)]
+
+        # Calculate proportion of vectors with matches within 0.01
+        near_exact_matches = np.abs(angle_correlation_flat - 1) < 0.01
+        near_exact_match_proportion = np.sum(near_exact_matches) / len(angle_correlation_flat) * 100
+
+        # Generate summary statistics
+        mean = np.mean(angle_correlation_flat)
+        median = np.median(angle_correlation_flat)
+        std = np.std(angle_correlation_flat)
+        min_val = np.min(angle_correlation_flat)
+        max_val = np.max(angle_correlation_flat)
+
+        # Write summary statistics to a text file
+        with open(output.summary_stats, 'w') as stats_file:
+            stats_file.write(f"Summary Statistics for PVS Vector Angle Correlation:\n")
+            stats_file.write(f"Mean: {mean:.4f}\n")
+            stats_file.write(f"Median: {median:.4f}\n")
+            stats_file.write(f"Standard Deviation: {std:.4f}\n")
+            stats_file.write(f"Minimum: {min_val:.4f}\n")
+            stats_file.write(f"Maximum: {max_val:.4f}\n")
+            stats_file.write(f"Number of Data Points: {len(angle_correlation_flat)}\n")
+            stats_file.write(f"Proportion of Nearly Exact Matches (|Correlation - 1| < 0.01): {near_exact_match_proportion:.4f}%\n")
+
+        # Generate the violin plot
+        plt.figure(figsize=(10, 6))
+        sns.violinplot(data=angle_correlation_flat, inner="quartile")
+        plt.title("Distribution of PVS Vector Angle Correlation")
+        plt.xlabel("PVS Correlation")
+        plt.ylabel("Angle Correlation (0 = Opposite, 1 = Aligned)")
+        plt.grid(True, linestyle="--", alpha=0.6)
+
+        # Save the plot
+        plt.savefig(output.violin_plot)
+        plt.close()
+
+
+
+# Validation Rules
+rule summaryStats:
+    input:
+        EPC_seg         =  expand("output/{subject}/segmentation/epc_seg.nii.gz",subject=subjects),
+        epcHistogram    =  expand("output/{subject}/segmentation/epcHistogram.png",subject=subjects),
+        WPSS_seg        =  expand("output/{subject}/segmentation/WPSS_seg.nii.gz",subject=subjects),
+
+    params:
+        subjects = subjects,
+
+    output:
+        summaryStats    = 'output/summary.csv',
+
+    shell:
+        """
+        # Define function to calculate volume from spacing and voxel count
+        calculate_volume() {{
+            local image=$1
+            local spacing=$(mrinfo $image -spacing | tr ' ' '*')
+            local voxel_count=$(mrstats $image -mask $image -output count)
+            echo "$spacing*$voxel_count" | bc -l
+        }}
+
+        # Initialize a temporary file for writing the CSV DWI
+        temp_file=$(mktemp)
+
+        # Write CSV header
+        echo "Subject,EPC,WPSS" > {output.summaryStats}
+
+        # Initialize sums for calculating the mean
+        sum_EPC=0
+        sum_WPSS=0
+        count=0
+
+        # Loop through subjects and calculate the volumes
+        for subject in {params.subjects}; do
+            EPC_volume=$(calculate_volume output/$subject/segmentation/epc_seg.nii.gz)
+            WPSS_volume=$(calculate_volume output/$subject/segmentation/WPSS_seg.nii.gz)
+
+            # Append individual volumes to CSV
+            echo "$subject,$EPC_volume,$WPSS_volume" >> {output.summaryStats}
+
+            # Update sums and counter for mean calculation
+            sum_EPC=$(echo "$sum_EPC + $EPC_volume" | bc -l)
+            sum_WPSS=$(echo "$sum_WPSS + $WPSS_volume" | bc -l)
+            count=$((count + 1))
+        done
+
+        # Calculate the mean volumes
+        mean_EPC=$(echo "$sum_EPC / $count" | bc -l)
+        mean_WPSS=$(echo "$sum_WPSS / $count" | bc -l)
+
+        # Append mean volumes as the last row
+        echo "Mean,$mean_EPC,$mean_WPSS" >> {output.summaryStats}
+
+        """
+
+
