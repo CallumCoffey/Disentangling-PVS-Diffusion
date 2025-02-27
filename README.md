@@ -18,3 +18,6 @@ brain. The model was further evaluated on synthetic data, confirming its stabili
 across a wide range of physiologically relevant conditions. This study provides
 a significant advancement in directly quantifying diffusion metrics from the PVS,
 simplifying the modeling process by integrating both PVS location and orientation.
+
+
+THIS SOFTWARE IS INTENDED FOR RESEARCH PURPOSES ONLY AND SHOULD IN NO WAY BE USED IN CLINCIAL PRACTICE.
